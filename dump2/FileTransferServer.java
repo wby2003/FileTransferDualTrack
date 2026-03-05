@@ -14,7 +14,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class FileTransferServer {
     private final int port;
     private final ExecutorService pool = Executors.newCachedThreadPool();
-    private final ConcurrentMap<String, AtomicInteger> partsToFinish = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, AtomicInteger> blocksToFinish = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Object> fileLocks = new ConcurrentHashMap<>();
     private final File outputDir;
 
@@ -49,7 +49,7 @@ public class FileTransferServer {
                 long len = in.readLong();
 
                 File out = new File(outputDir, name);
-                partsToFinish.computeIfAbsent(name, k -> new AtomicInteger(partCount));
+                AtomicInteger remained = blocksToFinish.putIfAbsent(name, new AtomicInteger(partCount));
                 fileLocks.putIfAbsent(name, new Object());
 
                 System.out.printf("recv %s part %d/%d offset=%d len=%d%n",
@@ -57,8 +57,8 @@ public class FileTransferServer {
 
                 Object lock = fileLocks.get(name);
                 synchronized (lock) {
-                    // Ensure file has correct size
-                    if (!out.exists()) {
+                    // Initialize/truncate target file once for each transfer.
+                    if (remained == null) {
                         try (RandomAccessFile raf = new RandomAccessFile(out, "rw")) {
                             raf.setLength(totalSize);
                         }
@@ -77,9 +77,10 @@ public class FileTransferServer {
                     }
                 }
 
-                int left = partsToFinish.get(name).decrementAndGet();
+                int left = blocksToFinish.get(name).decrementAndGet();
                 if (left == 0) {
-                    partsToFinish.remove(name);
+                    blocksToFinish.remove(name);
+                    fileLocks.remove(name);
                     System.out.println(name + " received completely");
                 }
             } catch (IOException e) {

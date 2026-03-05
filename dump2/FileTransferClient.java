@@ -1,3 +1,4 @@
+import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
@@ -6,7 +7,9 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -16,6 +19,7 @@ public class FileTransferClient {
     private static final int DEFAULT_BLOCK_SIZE = 1024 * 1024;
     private static final int PROBE_SIZE_BYTES = 4 * 1024 * 1024;
     private static final String PROBE_FILE_PREFIX = "__PROBE__";
+    private static final int ACK_REQUEST_PART_INDEX = -2;
     private final InetSocketAddress[] endpoints;
     private final int channels;
     private final int blockSize;
@@ -39,50 +43,100 @@ public class FileTransferClient {
         int totalBlocks = (int) ((size + blockSize - 1L) / blockSize);
         AtomicInteger nextBlock = new AtomicInteger(0);
         AtomicInteger nextEndpoint = new AtomicInteger(0);
+        long transferId = System.nanoTime();
 
         ExecutorService pool = Executors.newFixedThreadPool(channels);
         for (int i = 0; i < channels; i++) {
             pool.submit(() -> {
+                InetSocketAddress endpoint = endpoints[Math.floorMod(nextEndpoint.getAndIncrement(), endpoints.length)];
                 while (true) {
                     int blockIndex = nextBlock.getAndIncrement();
                     if (blockIndex >= totalBlocks) {
                         break;
                     }
-                    InetSocketAddress endpoint = endpoints[Math.floorMod(nextEndpoint.getAndIncrement(), endpoints.length)];
                     long offset = (long) blockIndex * blockSize;
                     long len = Math.min(blockSize, size - offset);
-                    sendBlock(endpoint, f, offset, len, blockIndex, totalBlocks);
+                    sendBlocksOnChannel(endpoint, f, size, transferId, totalBlocks, blockIndex, nextBlock);
+                    break;
                 }
             });
         }
         pool.shutdown();
         pool.awaitTermination(1, TimeUnit.HOURS);
+
+        if (!awaitTransferAck(f.getName(), size, transferId, totalBlocks)) {
+            throw new IOException("Transfer ACK failed for " + f.getName());
+        }
+        System.out.println("transfer ack success: " + f.getName());
     }
 
-    private void sendBlock(InetSocketAddress endpoint, File f, long offset, long len, int blockIndex, int totalBlocks) {
+    private boolean awaitTransferAck(String fileName, long totalSize, long transferId, int totalBlocks) {
+        Set<InetSocketAddress> uniqueEndpoints = new LinkedHashSet<>(Arrays.asList(endpoints));
+        for (InetSocketAddress endpoint : uniqueEndpoints) {
+            try (Socket s = new Socket()) {
+                s.connect(endpoint);
+                s.setSoTimeout(120_000);
+                try (DataOutputStream out = new DataOutputStream(s.getOutputStream());
+                     DataInputStream in = new DataInputStream(s.getInputStream())) {
+                    out.writeUTF(fileName);
+                    out.writeLong(totalSize);
+                    out.writeLong(transferId);
+                    out.writeInt(ACK_REQUEST_PART_INDEX);
+                    out.writeInt(totalBlocks);
+                    out.writeLong(0);
+                    out.writeLong(0);
+                    out.flush();
+                    return in.readBoolean();
+                }
+            } catch (IOException e) {
+                System.err.println("ack request failed via " + endpoint + ": " + e.getMessage());
+            }
+        }
+        return false;
+    }
+
+    private void sendBlocksOnChannel(InetSocketAddress endpoint,
+                                     File f,
+                                     long totalFileSize,
+                                     long transferId,
+                                     int totalBlocks,
+                                     int firstBlockIndex,
+                                     AtomicInteger nextBlock) {
         try (Socket s = new Socket()) {
             s.connect(endpoint);
             try (DataOutputStream out = new DataOutputStream(s.getOutputStream());
                  RandomAccessFile raf = new RandomAccessFile(f,"r")) {
-                out.writeUTF(f.getName());
-                out.writeLong(f.length());
-                out.writeInt(blockIndex);
-                out.writeInt(totalBlocks);
-                out.writeLong(offset);
-                out.writeLong(len);
-                raf.seek(offset);
                 byte[] buf = new byte[8192];
-                long rem = len;
-                while (rem > 0) {
-                    int r = raf.read(buf, 0, (int) Math.min(buf.length, rem));
-                    if (r<0) break;
-                    out.write(buf,0,r);
-                    rem -= r;
+                int blockIndex = firstBlockIndex;
+                while (blockIndex >= 0 && blockIndex < totalBlocks) {
+                    long offset = (long) blockIndex * blockSize;
+                    long len = Math.min(blockSize, totalFileSize - offset);
+
+                    out.writeUTF(f.getName());
+                    out.writeLong(totalFileSize);
+                    out.writeLong(transferId);
+                    out.writeInt(blockIndex);
+                    out.writeInt(totalBlocks);
+                    out.writeLong(offset);
+                    out.writeLong(len);
+
+                    raf.seek(offset);
+                    long rem = len;
+                    while (rem > 0) {
+                        int r = raf.read(buf, 0, (int) Math.min(buf.length, rem));
+                        if (r < 0) {
+                            break;
+                        }
+                        out.write(buf, 0, r);
+                        rem -= r;
+                    }
+                    System.out.println("sent block " + blockIndex + " via " + endpoint);
+                    blockIndex = nextBlock.getAndIncrement();
                 }
-                System.out.println("sent block " + blockIndex + " via " + endpoint);
+                out.flush();
             }
         } catch (IOException e) {
-            System.err.println("failed block " + blockIndex + " to " + endpoint + ": " + e);
+            System.err.println("channel failed to " + endpoint + ": " + e);
             e.printStackTrace();
         }
     }
@@ -212,12 +266,14 @@ public class FileTransferClient {
 
     private static double probeEndpointMBps(InetSocketAddress endpoint) {
         byte[] probeData = new byte[PROBE_SIZE_BYTES];
+        long probeTransferId = System.nanoTime();
         long start = System.nanoTime();
         try (Socket s = new Socket()) {
             s.connect(endpoint);
             try (DataOutputStream out = new DataOutputStream(s.getOutputStream())) {
                 out.writeUTF(PROBE_FILE_PREFIX + System.nanoTime());
                 out.writeLong(PROBE_SIZE_BYTES);
+                out.writeLong(probeTransferId);
                 out.writeInt(0);
                 out.writeInt(1);
                 out.writeLong(0);

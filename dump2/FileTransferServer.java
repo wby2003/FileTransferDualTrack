@@ -12,6 +12,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class FileTransferServer {
+    private static final String PROBE_FILE_PREFIX = "__PROBE__";
     private final int port;
     private final ExecutorService pool = Executors.newCachedThreadPool();
     private final ConcurrentMap<String, AtomicInteger> blocksToFinish = new ConcurrentHashMap<>();
@@ -48,17 +49,36 @@ public class FileTransferServer {
                 long offset = in.readLong();
                 long len = in.readLong();
 
+                if (name.startsWith(PROBE_FILE_PREFIX)) {
+                    byte[] probeBuf = new byte[8192];
+                    long remainingProbe = len;
+                    while (remainingProbe > 0) {
+                        int r = in.read(probeBuf, 0, (int) Math.min(probeBuf.length, remainingProbe));
+                        if (r < 0) {
+                            throw new EOFException();
+                        }
+                        remainingProbe -= r;
+                    }
+                    return;
+                }
+
                 File out = new File(outputDir, name);
-                AtomicInteger remained = blocksToFinish.putIfAbsent(name, new AtomicInteger(partCount));
-                fileLocks.putIfAbsent(name, new Object());
+                final boolean[] createdCounter = new boolean[] {false};
+                AtomicInteger counter = blocksToFinish.compute(name, (k, v) -> {
+                    if (v == null || v.get() <= 0) {
+                        createdCounter[0] = true;
+                        return new AtomicInteger(partCount);
+                    }
+                    return v;
+                });
+                Object lock = fileLocks.computeIfAbsent(name, k -> new Object());
 
                 System.out.printf("recv %s part %d/%d offset=%d len=%d%n",
                         name, part, partCount, offset, len);
 
-                Object lock = fileLocks.get(name);
                 synchronized (lock) {
                     // Initialize/truncate target file once for each transfer.
-                    if (remained == null) {
+                    if (createdCounter[0]) {
                         try (RandomAccessFile raf = new RandomAccessFile(out, "rw")) {
                             raf.setLength(totalSize);
                         }
@@ -77,10 +97,10 @@ public class FileTransferServer {
                     }
                 }
 
-                int left = blocksToFinish.get(name).decrementAndGet();
+                int left = counter.decrementAndGet();
                 if (left == 0) {
-                    blocksToFinish.remove(name);
-                    fileLocks.remove(name);
+                    blocksToFinish.remove(name, counter);
+                    fileLocks.remove(name, lock);
                     System.out.println(name + " received completely");
                 }
             } catch (IOException e) {
